@@ -1,4 +1,4 @@
-//  
+//
 //  Created by Manuel MAGALHAES on 14/01/13.
 //  Copyright (c) 2013 Valkaari. All rights reserved.
 //
@@ -34,16 +34,16 @@ namespace OceanSimulation
 				{
 					self.AddResult("Create the ocean object"_s, err);
 				}
-			
+
 				maxon::Result<void> res = simpleOceanRef.Init(128, 500, 0.01, 30, 20, 120, 1, 1, 12345);
 				self.AddResult("init the ocean simulation"_s, res);
-				
+
 				res = simpleOceanRef.Animate(0.3, 30, 1.0, 200, 1.0, true, true, true, false);
 				self.AddResult("Animate the ocean simulation"_s, res);
 
 				maxon::Vector disp, normal;
 				maxon::Float jminus;
-			
+
 				maxon::Vector p(0);
 
 				res = simpleOceanRef.EvaluatePoint(INTERTYPE::LINEAR, p, disp, normal, jminus);
@@ -66,9 +66,9 @@ namespace OceanSimulation
 			{
 				// speed test simulation
 				maxon::TimeValue   t = maxon::TimeValue::GetTime();
-			
+
 				ifnoerr (OceanSimulation::OceanRef simpleOceanRef = OceanSimulation::Ocean().Create())
-				{	
+				{
 					self.AddTimingResult("Time to create the ocean Object"_s, err, t.Stop());
 				}
 				else
@@ -76,7 +76,7 @@ namespace OceanSimulation
 					self.AddTimingResult("time to create the ocean Object"_s, err, t.Stop());
 					return err;
 				}
-				
+
 				for (maxon::Int32 j = 7; j < 11; j++)
 				{
 					t = maxon::TimeValue::GetTime();
@@ -119,4 +119,4 @@ namespace OceanSimulation
 	MAXON_COMPONENT_CLASS_REGISTER(SimpleOceanSimulationUnitTest, maxon::UnitTestClasses, "com.gamelogicdesign.OceanSimulation.unittest.SimpleOceanSimulation");
 	MAXON_COMPONENT_CLASS_REGISTER(SimpleOceanSimulationSpeedTest, maxon::SpeedTestClasses, "com.gamelogicdesign.OceanSimulation.unittest.SimpleOceanSimulationSpeed");
 }
-	
+

@@ -1,0 +1,6 @@
+STRINGTABLE OOceanEffectorKent
+{
+	OOceanEffectorKent "Ocean Simulation";
+   
+    ID_GRP_OCEAN_EFFECTOR "Ocean Effector";
+}

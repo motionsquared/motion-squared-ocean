@@ -1,23 +1,17 @@
-/*
- *  main.cpp
- *
- *  Created by Manuel MAGALHAES on 23/12/10.
- *  Copyright 2010 Valkaari. All rights reserved.
- *
- *  Modified by Kent Barber on 29/7/2022.
- *  Copyright 2022 GameLogicDesign Limited. All rights reserved.
- *
- */
-
-#ifndef MAIN_H__
-#define MAIN_H__
-
-#include "ge_prepass.h"
+#pragma once
+#include "c4d.h"
 #include "c4d_plugin.h"
-
-// forward declarations
-Bool RegisterOceanSimulationDeformer();
-Bool RegisterOceanSimulationDescription();
-Bool RegisterOceanSimulationEffector();
-
+#include <initializer_list>
+// Development-only IDs. Obtain permanent Maxon IDs before public distribution.
+#ifndef MS_OCEAN_DEFORMER_ID
+#define MS_OCEAN_DEFORMER_ID 1000001
 #endif
+#ifndef MS_OCEAN_EFFECTOR_ID
+#define MS_OCEAN_EFFECTOR_ID 1000002
+#endif
+#ifndef MS_OCEAN_DESCRIPTION_ID
+#define MS_OCEAN_DESCRIPTION_ID 1000003
+#endif
+cinema::Bool RegisterOceanSimulationDescription();
+cinema::Bool RegisterOceanSimulationDeformer();
+cinema::Bool RegisterOceanSimulationEffector();

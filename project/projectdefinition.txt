@@ -18,4 +18,4 @@ C4D=true
 
 
 // Custom ID
-ModuleId=com.gamelogicdesign.hot4D
+ModuleId=net.motionsquared.ocean

@@ -1,14 +1,20 @@
+// Cinema 4D ocean port: Manuel Magalhaes / Valkaari (2010-2013).
+// Copyright 2022 GameLogicDesign Limited. Kent Barber's HOT4D baseline.
+// C4D 2026 API adaptation incorporates work from Aitidi/HOT4D-C4D2026Plus.
+// Motion Squared modifications (2026): compatibility, masks, undo and build integration.
+// Distributed under GNU GPL v2; see LICENSE.txt and THIRD-PARTY-NOTICES.md.
+
 /*
+ *  waveMesh.cpp
+ *  waves
  *
  *  Created by Manuel MAGALHAES on 23/12/10.
  *  Copyright 2010 Valkaari. All rights reserved.
- * 
- *  Modified by Kent Barber on 29/07/22.
- *  Copyright 2022 GameLogicDesign Limited. All rights reserved.
  *
  */
 
 #include "c4d.h"
+#include "main.h"
 #include "c4d_symbols.h"
 #include "ge_prepass.h"
 
@@ -22,167 +28,219 @@
 #include "OOceanDeformer.h"
 #include "description/OceanDescription.h"
 
-#include "main.h"
+#include <cmath>
+
+
+
+namespace
+{
+	static inline Bool IsFiniteScalar(const maxon::Float value)
+	{
+		return std::isfinite(value) != 0;
+	}
+
+	static inline Bool IsFiniteVector(const maxon::Vector& value)
+	{
+		return IsFiniteScalar(value.x) && IsFiniteScalar(value.y) && IsFiniteScalar(value.z);
+	}
+}
 
 maxon::Float OceanSimulationDeformer::MapRange(maxon::Float value, const maxon::Float min_input, const maxon::Float max_input, const maxon::Float min_output, const maxon::Float max_output) const
 {
 	Float inrange = max_input - min_input;
 
-	if (CompareFloatTolerant(value, 0.0))
-		value = 0.0;  // Prevent DivByZero error
+	// Guard against degenerate source ranges before normalizing.
+	if (CompareFloatTolerant(inrange, 0.0))
+		value = 0.0;
 	else
 		value = (value - min_input) / inrange;    // Map input range to [0.0 ... 1.0]
 
 	if (value > max_output)
 		return max_output;
-
 	if (value < min_output)
 		return min_output;
-
 	return  min_output + (max_output - min_output) * value; // Map to output range and return result
+
+}
+
+Bool OceanSimulationDeformer::EnsureFalloff(BaseObject* op) const
+{
+	if (!op)
+		return false;
+	if (falloff_)
+		return true;
+
+	falloff_ = C4D_Falloff::Alloc(op->GetDataInstance());
+	if (!falloff_)
+		return false;
+	if (!falloff_->SetMode(FIELDS) || !falloff_->InitFalloff(nullptr, op))
+	{
+		C4D_Falloff::Free(falloff_);
+		return false;
+	}
+	return true;
+}
+
+Bool OceanSimulationDeformer::EnsureJacobianFoamTags(BaseObject* op) const
+{
+	if (!op)
+		return false;
+
+	BaseObject* target = op->GetUp() ? static_cast<BaseObject*>(op->GetUp()) : nullptr;
+	if ((!target || !target->IsInstanceOf(Opoint)) && op->GetDown())
+		target = static_cast<BaseObject*>(op->GetDown());
+	if (!target || !target->IsInstanceOf(Opoint))
+		return false;
+
+	const Int32 pointCount = ToPoint(target)->GetPointCount();
+	if (pointCount <= 0)
+		return false;
+
+	BaseDocument* doc = op->GetDocument();
+    if (!doc) return false;
+    doc->StartUndo();
+    finally { doc->EndUndo(); };
+    auto ensureVertexColorTag = [target, pointCount, doc](const maxon::String& tagName) -> VertexColorTag*
+	{
+		for (BaseTag* tag = target->GetFirstTag(); tag; tag = tag->GetNext())
+		{
+			if (tag->IsInstanceOf(Tvertexcolor) && tag->GetName() == tagName &&
+                static_cast<VertexColorTag*>(tag)->GetDataCount() == pointCount &&
+                static_cast<VertexColorTag*>(tag)->IsPerPointColor())
+				return static_cast<VertexColorTag*>(tag);
+		}
+
+		VertexColorTag* colorTag = VertexColorTag::Alloc(pointCount);
+		if (!colorTag)
+			return nullptr;
+		colorTag->SetPerPointMode(true);
+		colorTag->SetName(tagName);
+		target->InsertTag(colorTag);
+        doc->AddUndo(UNDOTYPE::NEWOBJ, colorTag);
+		return colorTag;
+	};
+
+	VertexColorTag* jacobTag = ensureVertexColorTag("Jminus"_s);
+	VertexColorTag* foamTag = ensureVertexColorTag("Foam"_s);
+	if (!jacobTag || !foamTag)
+		return false;
+
+	doc->AddUndo(UNDOTYPE::CHANGE, op);
+    op->SetParameter(CreateDescID(OD_JACOBMAP), GeData(jacobTag), DESCFLAGS_SET::NONE);
+	op->SetParameter(CreateDescID(OD_FOAMMAP), GeData(foamTag), DESCFLAGS_SET::NONE);
+	op->Message(MSG_UPDATE);
+	EventAdd();
+	return true;
 }
 
 Bool OceanSimulationDeformer::Message(GeListNode *node, Int32 type, void *t_data)
 {
-	BaseObject* op = (BaseObject*)node;
-	if (!op)
-		return false;
+	BaseObject* op = static_cast<BaseObject*>(node);
+	if (!falloff_)
+		EnsureFalloff(op);
+	if (falloff_)
+		falloff_->Message(static_cast<BaseList2D*>(node), type, t_data);
 
 	switch (type)
 	{
-	case MSG_MENUPREPARE:
-	{
-		((BaseObject*)node)->SetDeformMode(true);
-		break;
-	}
-	case MSG_DESCRIPTION_COMMAND:
-	{
-		DescriptionCommand* dc = (DescriptionCommand*)t_data;
-		switch (dc->_descId[0].id)
-		{
-		case OD_CREATE_FOAM_TAGS:
-		{
-			BaseObject* pParent = op->GetUp();
-			if (pParent && pParent->GetType() == Opolygon)
-			{
-				Int32 pcnt = ToPoint(pParent)->GetPointCount();
-
-				BaseDocument* doc = op->GetDocument();
-				if (doc)
-				{
-					doc->StartUndo();
-
-					VertexColorTag* pJacobTag = VertexColorTag::Alloc(pcnt);
-					if (pJacobTag)
-					{
-						pJacobTag->SetName("Jacob"_s);
-						pJacobTag->SetPerPointMode(true);
-
-						doc->AddUndo(UNDOTYPE::NEWOBJ, pJacobTag);
-						pParent->InsertTag(pJacobTag);
-
-						doc->AddUndo(UNDOTYPE::CHANGE, op);
-						op->SetParameter(OD_JACOBMAP, pJacobTag, DESCFLAGS_SET::FORCESET);
-					}
-
-					VertexColorTag* pFoamTag = VertexColorTag::Alloc(pcnt);
-					if (pFoamTag)
-					{
-						pFoamTag->SetName("Foam"_s);
-						pFoamTag->SetPerPointMode(true);
-
-						doc->AddUndo(UNDOTYPE::NEWOBJ, pFoamTag);
-						pParent->InsertTag(pFoamTag);
-
-						doc->AddUndo(UNDOTYPE::CHANGE, op);
-						op->SetParameter(OD_FOAMMAP, pFoamTag, DESCFLAGS_SET::FORCESET);
-					}
-
-					doc->SetActiveTag(pFoamTag);
-
-					doc->EndUndo();
-					EventAdd();
-
-					pParent->Message(MSG_UPDATE);
-					op->Message(MSG_UPDATE);
-				}
-			}
-			else
-			{
-				MessageDialog("To create the maps please make sure the parent object is editable"_s);
-			}
+		case MSG_MENUPREPARE: {
+			((BaseObject*)node)->SetDeformMode(true);
+			break;
 		}
-		break;
+		case MSG_DESCRIPTION_COMMAND:
+		{
+			DescriptionCommand* dc = static_cast<DescriptionCommand*>(t_data);
+			if (dc && dc->_descId[0].id == OD_CREATE_FOAM_TAGS)
+			{
+				if (!EnsureJacobianFoamTags(op))
+					MessageDialog("Create Foam Tags requires an editable point object."_s);
+				return true;
+			}
+			break;
 		}
-	}
-	default:
-		break;
+		case MSG_ANIMATE:
+		{
+			BaseObject* baseObject = static_cast<BaseObject*>(node);
+			if (baseObject)
+			{
+				baseObject->SetDirty(DIRTYFLAGS::DATA | DIRTYFLAGS::SELECT | DIRTYFLAGS::MATRIX);
+				baseObject->Message(MSG_UPDATE);
+			}
+			break;
+		}
+
+		default:
+			break;
 	}
 
 	return true;
 }
 
-Bool OceanSimulationDeformer::Init(GeListNode *node)
+Bool OceanSimulationDeformer::Init(GeListNode *node, Bool isCloneInit)
 {
 	iferr_scope_handler
 	{
-		DiagnosticOutput("Error: @", err);
+
 		return false;
 	};
 
+	// init the object with some variables in its basecontainer.
+
 	BaseObject		*op = (BaseObject*)node;
-	BaseContainer *bc = op->GetDataInstance();
+	if (!op)
+		return false;
 
-	bc->SetInt32(OD_OCEAN_RESOLUTION, 7);
-	bc->SetInt32(OD_SEED, 12345);
-	bc->SetFloat(OD_OCEAN_SIZE, 400.0);
-	bc->SetFloat(OD_WIND_SPEED, 20.0);
-	bc->SetFloat(OD_WIND_DIRECTION, 120.0);
-	bc->SetFloat(OD_SHRT_WAVELENGHT, 0.01);
-	bc->SetFloat(OD_WAVE_HEIGHT, 30.0);
-	bc->SetFloat(OD_CHOPAMOUNT, 0.5);
-	bc->SetFloat(OD_DAMP_REFLECT, 1.0);
-	bc->SetFloat(OD_WIND_ALIGNMENT, 1.0);
-	bc->SetFloat(OD_OCEAN_DEPTH, 200.0);
-	bc->SetFloat(OD_CURRENTTIME, 0.0);
-	bc->SetInt32(OD_TIMELOOP, 90);
-	bc->SetFloat(OD_TIMESCALE, 0.5);
-	bc->SetBool(OD_AUTO_ANIM_TIME, true);
-	bc->SetBool(OD_PRE_RUN_FOAM, false);
-	bc->SetBool(OD_DO_CATMU_INTER, false);
-	bc->SetBool(OD_DO_JACOBIAN, false);
-	bc->SetBool(OD_DO_CHOPYNESS, true);
-	bc->SetFloat(OD_PSEL_THRES, 0.1);
-	bc->SetFloat(OD_JACOB_THRES, 0.5);
-	bc->SetFloat(OD_FOAM_THRES, 0.03);
-	bc->SetBool(OD_ACTIVE_DEFORM, true);
+	if (!isCloneInit)
+	{
+		op->SetParameter(CreateDescID(OD_OCEAN_RESOLUTION), GeData(7), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_SEED), GeData(12345), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_OCEAN_SIZE), GeData(400.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_WIND_SPEED), GeData(20.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_WIND_DIRECTION), GeData(120.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_SHRT_WAVELENGHT), GeData(0.01), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_WAVE_HEIGHT), GeData(30.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_CHOPAMOUNT), GeData(0.5), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_DAMP_REFLECT), GeData(1.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_WIND_ALIGNMENT), GeData(1.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_OCEAN_DEPTH), GeData(200.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_CURRENTTIME), GeData(0.0), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_TIMELOOP), GeData(90), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_TIMESCALE), GeData(0.5), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_AUTO_ANIM_TIME), GeData(true), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_PRE_RUN_FOAM), GeData(false), DESCFLAGS_SET::NONE);  // should be false by default
+		op->SetParameter(CreateDescID(OD_DO_CATMU_INTER), GeData(false), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_DO_JACOBIAN), GeData(false), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_DO_CHOPYNESS), GeData(true), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_PSEL_THRES), GeData(0.1), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_JACOB_THRES), GeData(0.5), DESCFLAGS_SET::NONE);
+		op->SetParameter(CreateDescID(OD_FOAM_THRES), GeData(0.03), DESCFLAGS_SET::NONE);
 
-	if (_falloff)
-		if (!_falloff->InitFalloff(bc, NULL, op))
-			return false;
+		op->SetParameter(CreateDescID(OD_ACTIVE_DEFORM), GeData(true), DESCFLAGS_SET::NONE);
+	}
+
+	if (!EnsureFalloff(op))
+		return false;
 
 	return true;
 }
 
-Bool OceanSimulationDeformer::GetDDescription(GeListNode *node, Description *description, DESCFLAGS_DESC &flags)
+Bool OceanSimulationDeformer::GetDDescription(const GeListNode *node, Description *description, DESCFLAGS_DESC &flags) const
 {
 	BaseObject *op = (BaseObject*)node;
+	if (!falloff_)
+		EnsureFalloff(op);
 	if (!op)
 		return false;
-	BaseContainer *bc = op->GetDataInstance();
-	if (!bc)
-		return false;
-
 	if (!description->LoadDescription(op->GetType()))
 		return false;
 
 	//---------------------------------
 	// Add the falloff interface
-	if (_falloff)
+	if (falloff_)
 	{
-		if (!_falloff->SetMode(FIELDS, bc))
+		if (!falloff_->SetMode(FIELDS))
 			return false; // The falloff parameters have to have been setup before it can be added to the description, this like makes sure of that
-		if (!_falloff->AddFalloffToDescription(description, bc, DESCFLAGS_DESC::NONE))
+		if (!falloff_->AddFalloffToDescription(op, description, DESCFLAGS_DESC::NONE))
 			return false;
 	}
 
@@ -191,108 +249,123 @@ Bool OceanSimulationDeformer::GetDDescription(GeListNode *node, Description *des
 	return true;
 }
 
-Bool OceanSimulationDeformer::CopyTo(NodeData *dest, GeListNode *snode, GeListNode *dnode, COPYFLAGS flags, AliasTrans *trn)
+Bool OceanSimulationDeformer::CopyTo(NodeData *dest, const GeListNode *snode, GeListNode *dnode, COPYFLAGS flags, AliasTrans *trn) const
 {
 	OceanSimulationDeformer *df = (OceanSimulationDeformer*)dest;
 	if (!df)
 		return false;
-	if (_falloff && df->_falloff)
-		if (!_falloff->CopyTo(df->_falloff))
+	if (falloff_ && df->falloff_)
+		if (!falloff_->CopyTo(df->falloff_, static_cast<BaseList2D*>(dnode)))
 			return false;
 	return ObjectData::CopyTo(dest, snode, dnode, flags, trn);
+}
+
+maxon::Result<Bool> OceanSimulationDeformer::GetAccessedObjects(const BaseList2D* node, METHOD_ID method, AccessedObjectsCallback& access) const
+{
+	return GetAccessedObjectsDeformerBase(node, falloff_, method, access);
 }
 
 DRAWRESULT OceanSimulationDeformer::Draw(BaseObject *op, DRAWPASS drawpass, BaseDraw *bd, BaseDrawHelp *bh)
 {
 	if (!op->GetDeformMode())
 		return DRAWRESULT::SKIP;
-	BaseContainer *bc = op->GetDataInstance();
-	if (!bc)
-		return DRAWRESULT::FAILURE;
-	if (_falloff)
-		_falloff->Draw(bd, bh, drawpass, bc);
+	if (falloff_)
+		falloff_->Draw(op, bd, bh, drawpass);
 	return ObjectData::Draw(op, drawpass, bd, bh);
 }
 
-Bool OceanSimulationDeformer::GetDEnabling(GeListNode *node, const DescID &id, const GeData &t_data, DESCFLAGS_ENABLE flags, const BaseContainer *itemdesc)
+Bool OceanSimulationDeformer::GetDEnabling(const GeListNode *node, const DescID &id, const GeData &t_data, DESCFLAGS_ENABLE flags, const BaseContainer *itemdesc) const
 {
-	BaseObject* op = (BaseObject*)node;
-	if (!op)
-		return false;
-	BaseContainer* bc = op->GetDataInstance();
-	if (!bc)
-		return false;
+	GeData data;
 
-	Bool parentIsPolygon = false;
-	BaseObject* pParent = op->GetUp();
-	if (pParent && pParent->GetType() == Opolygon)
+	if (id[0].id == OD_CURRENTTIME)
 	{
-		parentIsPolygon = true;
+		node->GetParameter(CreateDescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
+		return !data.GetBool();
 	}
 
-	Bool doJacobian = bc->GetBool(OD_DO_JACOBIAN);
-	Bool autoAnimTime = bc->GetBool(OD_AUTO_ANIM_TIME);
-	Bool chopyness = bc->GetBool(OD_DO_CHOPYNESS);
-
-	switch (id[0].id)
+	if (id[0].id == OD_PRE_RUN_FOAM)
 	{
-	case OD_CURRENTTIME:
-		return !autoAnimTime;
-	case OD_JACOBMAP:
-	case OD_JACOB_THRES:
-	case OD_FOAMMAP:
-	case OD_FOAM_THRES:
-		return doJacobian && parentIsPolygon;
-	case OD_CREATE_FOAM_TAGS:
-		return doJacobian;
-	case OD_PRE_RUN_FOAM:
-		return doJacobian && parentIsPolygon && autoAnimTime;
-	case OD_CHOPAMOUNT:
-		return chopyness;
+		node->GetParameter(CreateDescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
+		return data.GetBool();
+	}
+
+	if (id[0].id == OD_CREATE_FOAM_TAGS)
+	{
+		node->GetParameter(CreateDescID(OD_DO_JACOBIAN), data, DESCFLAGS_GET::NONE);
+		return data.GetBool();
+	}
+
+	if (id[0].id == OD_JACOBMAP || id[0].id == OD_JACOB_THRES || id[0].id == OD_FOAMMAP || id[0].id == OD_FOAM_THRES || id[0].id == OD_PSEL_PARTICLES || id[0].id == OD_PSEL_THRES)
+	{
+		node->GetParameter(CreateDescID(OD_DO_JACOBIAN), data, DESCFLAGS_GET::NONE);
+		return data.GetBool();
 	}
 
 	return SUPER::GetDEnabling(node, id, t_data, flags, itemdesc);
 }
 
-Int32 OceanSimulationDeformer::GetHandleCount(BaseObject *op)
+Int32 OceanSimulationDeformer::GetHandleCount(const BaseObject *op) const
 {
-	BaseContainer *bc = op->GetDataInstance();
-	if (!bc)
-		return 0;
-	if (_falloff)
-		return _falloff->GetHandleCount(bc);
+	if (falloff_)
+		return falloff_->GetHandleCount();
 	return 0;
 }
 
 void OceanSimulationDeformer::GetHandle(BaseObject *op, Int32 i, HandleInfo &info)
 {
-	BaseContainer *bc = op->GetDataInstance();
-	if (!bc)
-		return;
-	if (_falloff)
-		_falloff->GetHandle(i, bc, info);
+	if (falloff_)
+		falloff_->GetHandle(i, info);
 }
 
 void OceanSimulationDeformer::SetHandle(BaseObject *op, Int32 i, Vector p, const HandleInfo &info)
 {
-	BaseContainer *bc = op->GetDataInstance();
-	if (!bc)
-		return;
-	if (_falloff)
-		_falloff->SetHandle(i, p, bc, info);
+	if (falloff_)
+		falloff_->SetHandle(i, p, info);
 }
 
-void OceanSimulationDeformer::CheckDirty(BaseObject* op, BaseDocument* doc)
+Bool OceanSimulationDeformer::AddToExecution(BaseObject* op, PriorityList* list)
 {
-	// fields
-	if (_falloff)
+	if (!list || !op)
+		return false;
+	list->Add(op, EXECUTIONPRIORITY_ANIMATION, EXECUTIONFLAGS::NONE);
+	return true;
+}
+
+EXECUTIONRESULT OceanSimulationDeformer::Execute(BaseObject* op, BaseDocument* doc, BaseThread* bt, Int32 priority, EXECUTIONFLAGS flags)
+{
+	if (!op || !doc)
+		return EXECUTIONRESULT::OK;
+
+	GeData data;
+	op->GetParameter(CreateDescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
+	if (data.GetBool())
 	{
-		BaseContainer *data = op->GetDataInstance();
-		Int32 dirty = _falloff->GetDirty(doc, data);
-		if (dirty != _falloffDirtyCheck)
+		const BaseTime btCurrentTime = doc->GetTime();
+		const maxon::Float currentFrame = btCurrentTime.GetFrame(doc->GetFps());
+		if (currentTime_ != currentFrame)
+		{
+			currentTime_ = currentFrame;
+			op->SetDirty(DIRTYFLAGS::DATA | DIRTYFLAGS::SELECT | DIRTYFLAGS::MATRIX);
+			op->Message(MSG_UPDATE);
+		}
+	}
+	return EXECUTIONRESULT::OK;
+}
+
+void OceanSimulationDeformer::CheckDirty(BaseObject* op, const BaseDocument* doc)
+{
+	if (!falloff_)
+		EnsureFalloff(op);
+
+	// fields
+	if (falloff_)
+	{
+		Int32 dirty = falloff_->GetDirty(op, doc);
+		if (dirty != falloffDirtyCheck_)
 		{
 			op->SetDirty(DIRTYFLAGS::DATA);
-			_falloffDirtyCheck = dirty;
+			falloffDirtyCheck_ = dirty;
 		}
 	}
 
@@ -300,29 +373,36 @@ void OceanSimulationDeformer::CheckDirty(BaseObject* op, BaseDocument* doc)
 	maxon::Bool						doAutoTime;
 	GeData							data;
 
-	op->GetParameter(DescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
+	op->GetParameter(CreateDescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
 	doAutoTime = data.GetBool();
 
 	if (doAutoTime)
 	{
 		BaseTime		btCurrentTime = doc->GetTime();
 		maxon::Float    currentFrame = btCurrentTime.GetFrame(doc->GetFps());
-		if (_currentTime != currentFrame)
+		if (currentTime_ != currentFrame)
 		{
-			_currentTime = currentFrame;
-			op->SetDirty(DIRTYFLAGS::DATA);
+			currentTime_ = currentFrame;
+			op->SetDirty(DIRTYFLAGS::DATA | DIRTYFLAGS::SELECT | DIRTYFLAGS::MATRIX);
+			op->Message(MSG_UPDATE);
+			EventAdd(EVENT::ANIMATE);
 		}
 	}
+
 }
 
-Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, BaseObject *op, const Matrix &op_mg, const Matrix &mod_mg, Float lod, Int32 flags, BaseThread *thread)
+Bool OceanSimulationDeformer::ModifyObject(const BaseObject *mod, const BaseDocument *doc, BaseObject *op, const Matrix &op_mg, const Matrix &mod_mg, Float lod, Int32 flags, BaseThread *thread) const
 {
+	if (!falloff_)
+		EnsureFalloff(const_cast<BaseObject*>(mod));
+
 	iferr_scope_handler
 	{
+		DiagnosticOutput("Motion Squared Ocean: deformation failed: @", err);
 		return false;
 	};
 
-	if (!op->IsInstanceOf(Opoint) || !_falloff)
+	if (!op->IsInstanceOf(Opoint) || !falloff_)
 		return true;
 
 	maxon::Int32                    pcnt;
@@ -330,16 +410,18 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 	VertexColorTag					*jacobmaptag = nullptr;
 	VertexColorTag					*foammaptag = nullptr;
 
-	VertexColorHandle				jacobpoint = nullptr;
-	VertexColorHandle               foampoint = nullptr;
+	/*maxon::Float32                  *jacobpoint = nullptr;
+	maxon::Float32                  *foampoint = nullptr;
+*/
+
+	VertexColorHandle                  jacobpoint = nullptr;
+	VertexColorHandle                  foampoint = nullptr;
 
 	maxon::Float32                  *weight = nullptr;
 	maxon::Float                    pselThres;
 	maxon::Float                    jacobThres, foamThres;
 	BaseSelect						*bsp = nullptr;
 	SelectionTag					*stag = nullptr;
-	maxon::Vector					p;
-	maxon::Vector					dispvalue;
 	maxon::Vector					*padr = nullptr;
 
 	maxon::Float					oceanSize, windSpeed, windDirection, shrtWaveLenght, waveHeight, chopAmount, dampReflection, windAlign, oceanDepth, timeScale;
@@ -348,58 +430,104 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 
 	padr = ToPoint(op)->GetPointW();
 	pcnt = ToPoint(op)->GetPointCount();
-
-	if (!pcnt)
+	if (!padr || !pcnt)
 		return true;
-
 	weight = ToPoint(op)->CalcVertexMap(mod);
-
-	finally {
+	finally{
 		DeleteMem(weight);
 	};
+	mod->GetParameter(CreateDescID(OD_OCEAN_RESOLUTION), data, DESCFLAGS_GET::NONE);
+	oceanResolution = 1 << data.GetInt32();
 
-	BaseContainer* bc = mod->GetDataInstance();
+	mod->GetParameter(CreateDescID(OD_OCEAN_SIZE), data, DESCFLAGS_GET::NONE);
+	oceanSize = data.GetFloat();
 
-	oceanResolution = 1 << bc->GetInt32(OD_OCEAN_RESOLUTION);
-	oceanSize = bc->GetFloat(OD_OCEAN_SIZE);
-	shrtWaveLenght = bc->GetFloat(OD_SHRT_WAVELENGHT);
-	waveHeight = bc->GetFloat(OD_WAVE_HEIGHT);
-	windSpeed = bc->GetFloat(OD_WIND_SPEED);
-	windDirection = DegToRad(bc->GetFloat(OD_WIND_DIRECTION));
-	windAlign = bc->GetFloat(OD_WIND_ALIGNMENT);
-	dampReflection = bc->GetFloat(OD_DAMP_REFLECT);
-	seed = bc->GetInt32(OD_SEED);
-	oceanDepth = bc->GetFloat(OD_OCEAN_DEPTH);
-	chopAmount = bc->GetFloat(OD_CHOPAMOUNT);
-	timeLoop = bc->GetInt32(OD_TIMELOOP);
-	timeScale = bc->GetFloat(OD_TIMESCALE);
-	doAutoTime = bc->GetBool(OD_AUTO_ANIM_TIME);
+	mod->GetParameter(CreateDescID(OD_SHRT_WAVELENGHT), data, DESCFLAGS_GET::NONE);
+	shrtWaveLenght = data.GetFloat();
 
+	mod->GetParameter(CreateDescID(OD_WAVE_HEIGHT), data, DESCFLAGS_GET::NONE);
+	waveHeight = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_WIND_SPEED), data, DESCFLAGS_GET::NONE);
+	windSpeed = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_WIND_DIRECTION), data, DESCFLAGS_GET::NONE);
+	windDirection = DegToRad(data.GetFloat());
+
+	mod->GetParameter(CreateDescID(OD_WIND_ALIGNMENT), data, DESCFLAGS_GET::NONE);
+	windAlign = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_DAMP_REFLECT), data, DESCFLAGS_GET::NONE);
+	dampReflection = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_SEED), data, DESCFLAGS_GET::NONE);
+	seed = data.GetInt32();
+
+	mod->GetParameter(CreateDescID(OD_OCEAN_DEPTH), data, DESCFLAGS_GET::NONE);
+	oceanDepth = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_CHOPAMOUNT), data, DESCFLAGS_GET::NONE);
+	chopAmount = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_TIMELOOP), data, DESCFLAGS_GET::NONE);
+	timeLoop = data.GetInt32();
+
+	mod->GetParameter(CreateDescID(OD_TIMESCALE), data, DESCFLAGS_GET::NONE);
+	timeScale = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_AUTO_ANIM_TIME), data, DESCFLAGS_GET::NONE);
+	doAutoTime = data.GetBool();
+
+	if (doAutoTime) currentTime_ = doc->GetTime().GetFrame(doc->GetFps());
 	if (!doAutoTime)
 	{
 		// currentTime is set in checkDirty
-		_currentTime = bc->GetFloat(OD_CURRENTTIME);
+		mod->GetParameter(CreateDescID(OD_CURRENTTIME), data, DESCFLAGS_GET::NONE);
+		const_cast<OceanSimulationDeformer*>(this)->currentTime_ = data.GetFloat();
 	}
 
-	doCatmuInter = bc->GetBool(OD_DO_CATMU_INTER);
-	doJacobian = bc->GetBool(OD_DO_JACOBIAN);
-	doChopyness = bc->GetBool(OD_DO_CHOPYNESS);
-	doNormals = bc->GetBool(OD_DO_NORMALS) && !doChopyness; // why choppyness ???  normals are not used !!
-	preRunFoam = bc->GetBool(OD_PRE_RUN_FOAM);
-	jacobmaptag = (VertexColorTag*)bc->GetLink(OD_JACOBMAP, doc, Tvertexcolor);
-	foammaptag = (VertexColorTag*)bc->GetLink(OD_FOAMMAP, doc, Tvertexcolor);
-	stag = (SelectionTag*)bc->GetLink(OD_PSEL_PARTICLES, doc, Tpointselection);
-	pselThres = bc->GetFloat(OD_PSEL_THRES);
-	jacobThres = bc->GetFloat(OD_JACOB_THRES);
-	foamThres = bc->GetFloat(OD_FOAM_THRES);
+	mod->GetParameter(CreateDescID(OD_DO_CATMU_INTER), data, DESCFLAGS_GET::NONE);
+	doCatmuInter = data.GetBool();
 
-	maxon::Bool doDeform = bc->GetBool(OD_ACTIVE_DEFORM);
+	mod->GetParameter(CreateDescID(OD_DO_JACOBIAN), data, DESCFLAGS_GET::NONE);
+	doJacobian = data.GetBool();
+
+	mod->GetParameter(CreateDescID(OD_DO_CHOPYNESS), data, DESCFLAGS_GET::NONE);
+	doChopyness = data.GetBool();
+
+	mod->GetParameter(CreateDescID(OD_DO_NORMALS), data, DESCFLAGS_GET::NONE);
+	doNormals = data.GetBool() && !doChopyness; // why choppyness ???  normals are not used !!
+
+	mod->GetParameter(CreateDescID(OD_PRE_RUN_FOAM), data, DESCFLAGS_GET::NONE);
+	preRunFoam = data.GetBool();
+
+	mod->GetParameter(CreateDescID(OD_JACOBMAP), data, DESCFLAGS_GET::NONE);
+	//jacobmaptag = (VertexMapTag*)data.GetLink(doc, Tvertexmap);
+	jacobmaptag = (VertexColorTag*)data.GetLink(doc, Tvertexcolor);
+
+	mod->GetParameter(CreateDescID(OD_FOAMMAP), data, DESCFLAGS_GET::NONE);
+	//foammaptag = (VertexMapTag*)data.GetLink(doc, Tvertexmap);
+	foammaptag = (VertexColorTag*)data.GetLink(doc, Tvertexcolor);
+
+	mod->GetParameter(CreateDescID(OD_PSEL_PARTICLES), data, DESCFLAGS_GET::NONE);
+	stag = (SelectionTag*)data.GetLink(doc, Tpointselection);
+
+	mod->GetParameter(CreateDescID(OD_PSEL_THRES), data, DESCFLAGS_GET::NONE);
+	pselThres = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_JACOB_THRES), data, DESCFLAGS_GET::NONE);
+	jacobThres = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_FOAM_THRES), data, DESCFLAGS_GET::NONE);
+	foamThres = data.GetFloat();
+
+	mod->GetParameter(CreateDescID(OD_ACTIVE_DEFORM), data, DESCFLAGS_GET::NONE);
+	maxon::Bool doDeform = data.GetBool();
 
 	if (jacobmaptag)
 	{
 
 		jacobmaptag->SetPerPointMode(true);
-
 
 		if (jacobmaptag->GetDataCount() == pcnt)
 		{
@@ -427,25 +555,45 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 
 	if (stag)
 	{
-		bsp = stag->GetBaseSelect();
+		bsp = stag->GetWritableBaseSelect();
 		if (bsp)
 			bsp->DeselectAll();
 	}
 
-	if (_oceanSimulationRef == nullptr)
+	if (oceanSimulationRef_ == nullptr)
+    {
+        oceanSimulationRef_ = OceanSimulation::Ocean().Create() iferr_return;
+    }
+
+	if (oceanSimulationRef_.NeedUpdate(oceanResolution, oceanSize, shrtWaveLenght, waveHeight, windSpeed, windDirection, windAlign, dampReflection, seed))
 	{
-		_oceanSimulationRef = OceanSimulation::Ocean().Create() iferr_return;
+		iferr (oceanSimulationRef_.Init(oceanResolution, oceanSize, shrtWaveLenght, waveHeight, windSpeed, windDirection, windAlign, dampReflection, seed))
+		{
+			DiagnosticOutput("Motion Squared Ocean: initialization failed: @", err);
+			return false;
+		};
 	}
 
-	if (_oceanSimulationRef.NeedUpdate(oceanResolution, oceanSize, shrtWaveLenght, waveHeight, windSpeed, windDirection, windAlign, dampReflection, seed))
+	iferr (oceanSimulationRef_.Animate(currentTime_, timeLoop, timeScale, oceanDepth, chopAmount, true, doChopyness, doJacobian, doNormals))
 	{
-		_oceanSimulationRef.Init(oceanResolution, oceanSize, shrtWaveLenght, waveHeight, windSpeed, windDirection, windAlign, dampReflection, seed) iferr_return;
-	}
+		DiagnosticOutput("Motion Squared Ocean: animation failed: @", err);
+		return false;
+	};
 
-	_oceanSimulationRef.Animate(_currentTime, timeLoop, timeScale, oceanDepth, chopAmount, true, doChopyness, doJacobian, doNormals) iferr_return;
-
+	const Bool hasFalloffContent = falloff_->HasContent();
 	FieldInput inputs(padr, pcnt, op_mg);
-	Bool outputsOK = _falloff->PreSample(doc, mod, inputs, FIELDSAMPLE_FLAG::VALUE);
+	FieldOutput fieldSamples;
+	FalloffDataData falloffData;
+	Bool outputsOK = false;
+	if (hasFalloffContent)
+	{
+		if (falloff_->InitFalloff(doc, mod, falloffData))
+			outputsOK = falloff_->PreSample(mod, doc, inputs, fieldSamples, falloffData, FIELDSAMPLE_FLAG::VALUE);
+		else
+            return false;
+        if (!outputsOK)
+            return false;
+	}
 
 	OceanSimulation::INTERTYPE interType = OceanSimulation::INTERTYPE::LINEAR;
 	if (doCatmuInter)
@@ -456,51 +604,72 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 
 	maxon::BaseArray<maxon::Float> storeJminus;
 	storeJminus.Resize(pcnt) iferr_return;
+    for (Int32 i = 0; i < pcnt; ++i) storeJminus[i] = 0.0;
+	maxon::BaseArray<maxon::Bool> storeSelection;
+	storeSelection.Resize(pcnt) iferr_return;
+	for (maxon::Int32 i = 0; i < pcnt; ++i)
+		storeSelection[i] = false;
 
-	auto updatePoints = [this, &padr, &interType, &doChopyness, &doJacobian, &outputsOK, &weight, &jacobmaptag, &jacobpoint, &bsp, &pselThres, &storeJminus, &doDeform](maxon::Int32 i)
+	auto updatePoints = [this, &mod, &padr, &interType, &doChopyness, &doJacobian, &outputsOK, &fieldSamples, &falloffData, &weight, &jacobmaptag, &jacobpoint, &pselThres, &storeJminus, &storeSelection, &doDeform](maxon::Int32 i)
 	{
+
 		iferr_scope_handler
 		{
-			err.DbgStop();
 			return;
 		};
-
 		maxon::Vector p = padr[i];
+		if (!IsFiniteVector(p))
+			return;
 
-		maxon::Vector disp, normal, dispValue;
-		maxon::Float jMinus;
+		maxon::Vector disp, normal;
+		maxon::Float jMinus = 0.0;
 
-		_oceanSimulationRef.EvaluatePoint(interType, p, disp, normal, jMinus) iferr_return;
+		oceanSimulationRef_.EvaluatePoint(interType, p, disp, normal, jMinus) iferr_return;
+		if (!IsFiniteVector(disp) || !IsFiniteScalar(jMinus))
+			return;
 
 		Float fallOffSampleValue(1.0);
 		if (outputsOK)
-			_falloff->Sample(p, &fallOffSampleValue, true, 0.0, nullptr, i);
+		{
+			falloff_->Sample(mod, p, &fallOffSampleValue, &fieldSamples, falloffData, true, 0.0, i);
+			if (!IsFiniteScalar(fallOffSampleValue))
+                fallOffSampleValue = 0.0;
+		}
 		disp *= fallOffSampleValue;
 
 		if (weight)
-			disp *= weight[i];
+		{
+			const maxon::Float weightValue = weight[i];
+			disp *= IsFiniteScalar(weightValue) ? weightValue : 0.0;
+		}
 
 		if (doChopyness)
 			p += disp;
 		else
 			p.y += disp.y;
+		if (!IsFiniteVector(p))
+			return;
 
 		if (doJacobian)
 		{
 			maxon::Float jMinusValue = -jMinus;
 
 			if (weight)
-				jMinusValue *= weight[i];
+				jMinusValue *= IsFiniteScalar(weight[i]) ? weight[i] : 0.0;
+			// jminusValue is stored in the array
+			// if (jacobmaptag && jacobpoint)
+			//	jacobpoint[i] = maxon::SafeConvert<maxon::Float32>(jminusvalue);
 
-			if (bsp)
-				if (jMinusValue > pselThres)
-					bsp->Toggle(i);
+			if (jMinusValue > pselThres)
+				storeSelection[i] = true;
 
 			storeJminus[i] = jMinusValue;
 		}
 		else if (jacobmaptag && jacobpoint) // tag are present but not the option,  reset the value
 		{
+			//jacobmaptag->Set(jacobpoint, jacobpoint[i] = 0.0;
 			jacobmaptag->Set(jacobpoint, nullptr, nullptr, i, maxon::ColorA32(0.0));
+
 		}
 		if (doDeform)
 			padr[i] = p; // finally update the point
@@ -527,9 +696,19 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 		jacobmaptag->SetDirty(DIRTYFLAGS::NONE);
 	}
 
+	if (bsp && doJacobian)
+	{
+		for (maxon::Int32 i = 0; i < pcnt; ++i)
+		{
+			if (storeSelection[i])
+				bsp->Select(i);
+		}
+	}
+
 	if (foammaptag && foampoint && jacobpoint && jacobmaptag && doJacobian)
 	{
-		if (preRunFoam && doAutoTime && _currentTime == 0.0)
+
+		if (preRunFoam && doAutoTime && currentTime_ == 0.0)
 		{
 			// run simulation for xx frame and get the jminus vertex map from here.
 			// only available in autoTime mode and frame 0.0  (or time offset if implemented)
@@ -537,20 +716,21 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 			// calculate 15 frame before
 			maxon::BaseArray<maxon::Float32> foamAtFrameZero;
 			foamAtFrameZero.Resize(pcnt) iferr_return;
+			for (Int32 i = 0; i < pcnt; ++i) foamAtFrameZero[i] = 0.0f;
 
 			// clear the vertex map
-			auto clearFoamTag = [&foammaptag, &foampoint](maxon::Int32 i)
+			auto clearFoamTag = [&foammaptag, &foampoint ](maxon::Int32 i)
 			{
 				//foampoint[i] = 0.0;
 				foammaptag->Set(foampoint, nullptr, nullptr, i, maxon::ColorA32(0.0));
 			};
+
 			maxon::ParallelFor::Dynamic(0, pcnt, clearFoamTag);
 
-			maxon::TimeValue t = maxon::TimeValue::GetTime();
-			for (maxon::Int32 j = -90; j <= 0; j++)
+			for (maxon::Int32 j = -90 ; j <= 0 ; j++)
 			{
-				// animate the ocean 
-				_oceanSimulationRef.Animate(j, timeLoop, timeScale, oceanDepth, chopAmount, true, doChopyness, doJacobian, doNormals) iferr_return;
+				// animate the ocean
+				oceanSimulationRef_.Animate(j, timeLoop, timeScale, oceanDepth, chopAmount, true, doChopyness, doJacobian, doNormals) iferr_return;
 
 				auto getJminus = [this, &padr, &interType, &weight, &storeJminus](maxon::Int32 i)
 				{
@@ -563,10 +743,10 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 					maxon::Vector disp, normal;
 					maxon::Float jMinus;
 
-					_oceanSimulationRef.EvaluatePoint(interType, p, disp, normal, jMinus) iferr_return;
+					oceanSimulationRef_.EvaluatePoint(interType, p, disp, normal, jMinus) iferr_return;
 					maxon::Float jMinusValue = -jMinus;
 					if (weight)
-						jMinusValue *= weight[i];
+						jMinusValue *= IsFiniteScalar(weight[i]) ? weight[i] : 0.0;
 
 					storeJminus[i] = jMinusValue;
 				};
@@ -580,7 +760,6 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 					if (jvalue < newMin)
 						newMin = jvalue;
 				}
-
 				auto updateTag = [&storeJminus, &newMax, &newMin, this](maxon::Int32 i)
 				{
 					storeJminus[i] = maxon::SafeConvert<maxon::Float32>(MapRange(storeJminus[i], newMin, newMax, 0.0, 1.0));
@@ -594,11 +773,11 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 						foamAtFrameZero[i] -= maxon::SafeConvert<maxon::Float32>(foamThres);
 
 					foamAtFrameZero[i] = maxon::Clamp01(foamAtFrameZero[i]);
+
 				};
 				maxon::ParallelFor::Dynamic(0, pcnt, updateFoam);
-			} // end for foam before
 
-			ApplicationOutput("time to calculate the sequence @ ", t.Stop());
+			} // end for foam before
 
 			auto updateFoamTag = [&foammaptag, &foampoint, &foamAtFrameZero](maxon::Int32 i)
 			{
@@ -607,31 +786,35 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 			};
 
 			maxon::ParallelFor::Dynamic(0, pcnt, updateFoamTag);
+
 		}
 		else
 		{
-			// calculate normal foam 
-			BaseTime currentTime;
-			Int32     currentFrame;
-			currentTime = doc->GetTime();
-			currentFrame = currentTime.GetFrame(doc->GetFps());
 
+			// calculate normal foam
 			auto updateTag = [&jacobmaptag, &foammaptag, &foampoint, &jacobpoint, &jacobThres, &foamThres, this](maxon::Int32 i) {
 
-				if (jacobmaptag->Get(jacobpoint, nullptr, nullptr, i).r > jacobThres)
-				{
-					maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
-					color += maxon::ColorA32(maxon::SafeConvert<maxon::Float32>((MapRange(jacobmaptag->Get(jacobpoint, nullptr, nullptr, i).r, jacobThres, 1.0, 0.0, 1.0) - foamThres)));
-					foammaptag->Set(foampoint, nullptr, nullptr, i, color);
-				}
-				else
-				{
-					maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
-					color -= maxon::ColorA32(maxon::SafeConvert<maxon::Float32>(foamThres));
-					foammaptag->Set(foampoint, nullptr, nullptr, i, color);
-				}
-				maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
-				foammaptag->Set(foampoint, nullptr, nullptr, i, color.Clamp01());
+					if (jacobmaptag->Get(jacobpoint, nullptr, nullptr, i).r > jacobThres)
+					{
+						//foampoint[i] += maxon::SafeConvert<maxon::Float32>((MapRange(jacobpoint[i], jacobThres, 1, 0, 1) - foamThres));
+						maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
+						color += maxon::ColorA32(maxon::SafeConvert<maxon::Float32>((MapRange(jacobmaptag->Get(jacobpoint, nullptr, nullptr, i).r , jacobThres, 1.0, 0.0, 1.0) - foamThres)));
+						foammaptag->Set(foampoint, nullptr, nullptr, i, color);
+					}
+					else
+					{
+						maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
+						color -= maxon::ColorA32(maxon::SafeConvert<maxon::Float32>(foamThres));
+
+						foammaptag->Set(foampoint, nullptr, nullptr, i, color);
+						//foampoint[i] -= maxon::SafeConvert<maxon::Float32>(foamThres);
+
+					}
+						maxon::ColorA32 color = foammaptag->Get(foampoint, nullptr, nullptr, i);
+
+						foammaptag->Set(foampoint, nullptr, nullptr, i, color.Clamp01());
+						//foampoint[i] = maxon::Clamp01(foampoint[i]);
+
 			};
 			maxon::ParallelFor::Dynamic(0, pcnt, updateTag);
 		}
@@ -644,11 +827,29 @@ Bool OceanSimulationDeformer::ModifyObject(BaseObject *mod, BaseDocument *doc, B
 	}
 
 	op->Message(MSG_UPDATE);
+
 	return true;
+
 }
 
-#define GLD_ID_OCEAN_SIMULATION_DEFORMER 1057479
 Bool RegisterOceanSimulationDeformer()
 {
-	return RegisterObjectPlugin(GLD_ID_OCEAN_SIMULATION_DEFORMER, "HOT 4D"_s, OBJECT_MODIFIER, OceanSimulationDeformer::Alloc, "OOceanDeformer"_s, AutoBitmap("hot4D.tif"_s), 0);
+    if (!RegisterObjectPlugin(MS_OCEAN_DEFORMER_ID, "Motion Squared Ocean"_s,
+        OBJECT_MODIFIER | OBJECT_CALL_ADDEXECUTION, OceanSimulationDeformer::Alloc,
+        "OOceanDeformer"_s, AutoBitmap("hot4D.tif"_s), 0)) return false;
+#ifdef MS_OCEAN_LEGACY_COMPAT
+    for (Int32 id : {1051458, 1057479})
+    {
+        if (FindPlugin(id, PLUGINTYPE::ANY))
+        {
+            DiagnosticOutput("Motion Squared Ocean: legacy deformer ID @ is already registered; leaving its handler in place.", id);
+            continue;
+        }
+        if (!RegisterObjectPlugin(id, "HOT4D Legacy (Motion Squared)"_s,
+            OBJECT_MODIFIER | OBJECT_CALL_ADDEXECUTION | PLUGINFLAG_HIDE | PLUGINFLAG_HIDEPLUGINMENU,
+            OceanSimulationDeformer::Alloc, id == 1051458 ? "OOceanDeformerValkaari"_s : "OOceanDeformerKent"_s,
+            AutoBitmap("hot4D.tif"_s), 0)) return false;
+    }
+#endif
+    return true;
 }

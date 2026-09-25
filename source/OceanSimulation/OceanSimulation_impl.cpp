@@ -1,4 +1,4 @@
-//  
+//
 //  Created by Manuel MAGALHAES on 14/01/13.
 //  Copyright (c) 2013 Valkaari. All rights reserved.
 //
@@ -14,19 +14,12 @@
 #include "maxon/atomictypes.h"
 
 #include "maxon/parallelimage.h"
+#include "maxon/jobgroup.h"
+#include <limits>
 #include "c4d_thread.h"
 
 namespace OceanSimulation
 {
-	// this is the start of implementing the job title parallelize cool super fast for hot4D
-	class DisplacementJob : public maxon::JobInterfaceTemplate<DisplacementJob, maxon::Bool>
-	{
-		maxon::Result<void> operator()()
-		{
-			return SetResult(false);
-		}
-	};
-
 	const maxon::Float gravity = 9.81;
 
 	//----------------------------------------------------------------------------------------
@@ -48,9 +41,9 @@ namespace OceanSimulation
 
 	//----------------------------------------------------------------------------------------
 	/// calculate a linear interpolation beetween two values
-	/// @param[in]  a  : the first value 
-	/// @param[in]  b  : the second value 
-	/// @param[in]  f  : the weight of the interpolation 
+	/// @param[in]  a  : the first value
+	/// @param[in]  b  : the second value
+	/// @param[in]  f  : the weight of the interpolation
 	/// @return the interpolated value
 	//----------------------------------------------------------------------------------------
 	template<typename T>
@@ -61,7 +54,7 @@ namespace OceanSimulation
 
 	//----------------------------------------------------------------------------------------
 	/// calculate a catmull Rom interpolation
-	/// @param[in]  p0  : the first value 
+	/// @param[in]  p0  : the first value
 	/// @param[in]  p1  : the second value
 	/// @param[in]  p2  : the third value
 	/// @param[in]  p3  : the fourth value
@@ -103,8 +96,18 @@ namespace OceanSimulation
 			fftin_.Resize(M_, N_) iferr_return;
 			foam_.Resize(M_, N_) iferr_return;
 			jMinus_.Resize(M_, N_) iferr_return;
-			
-			maxon::LinearCongruentialRandom<maxon::Float32> randNumber; 
+			dispX_.Resize(M_, N_) iferr_return;
+			dispY_.Resize(M_, N_) iferr_return;
+			dispZ_.Resize(M_, N_) iferr_return;
+			normX_.Resize(M_, N_) iferr_return;
+			normY_.Resize(M_, N_) iferr_return;
+			normZ_.Resize(M_, N_) iferr_return;
+			jxx_.Resize(M_, N_) iferr_return;
+			jzz_.Resize(M_, N_) iferr_return;
+			jxz_.Resize(M_, N_) iferr_return;
+
+
+			maxon::LinearCongruentialRandom<maxon::Float32> randNumber;
 			randNumber.Init(seed);
 
 			WHat_ = GetWindDirectionNormalized(windDirection);
@@ -122,7 +125,7 @@ namespace OceanSimulation
 					maxon::Complex<maxon::Float> rc(RandomGaussian(randNumber), RandomGaussian(randNumber));
 
 					h0_(i, j) = rc * (maxon::Sqrt(Phillips(k)) * maxon::SQRT2_INV);
-					h0_minus_(i, j) = rc * (maxon::Sqrt(Phillips(-k)) * maxon::SQRT2_INV);  // no /2.0 but * by 1 / maxon::Sqrt(2.0) 
+					h0_minus_(i, j) = rc * (maxon::Sqrt(Phillips(-k)) * maxon::SQRT2_INV);  // no /2.0 but * by 1 / maxon::Sqrt(2.0)
 				}
 			}
 
@@ -132,7 +135,7 @@ namespace OceanSimulation
 
 		MAXON_METHOD maxon::Bool NeedUpdate(const maxon::Int32 oceanResolution, const maxon::Float oceanSize, const maxon::Float shortestWaveLength,
 			const maxon::Float amplitude, const maxon::Float windSpeed, const maxon::Float windDirection, const maxon::Float alignement, const maxon::Float damp,
-			const maxon::Int32 seed) const 
+			const maxon::Int32 seed) const
 		{
 
 			if (M_ != oceanResolution || N_ != oceanResolution)
@@ -161,13 +164,13 @@ namespace OceanSimulation
 		{
 			iferr_scope_handler
 			{
-				return err;	
+				return err;
 			};
 
 			// for now ParallelFor is faster for a resolution at 128, after that, ParallelImage is faster.
-			
+
 			// for other functions like eval_UV() or Omega()
-			Omega0_ = maxon::PI2 / (loopPeriod*timeScale);
+			Omega0_ = (loopPeriod > 0 && timeScale != 0.0) ? maxon::PI2 / (loopPeriod*timeScale) : 0.0;
 			oceanDepth_ = oceanDepth;
 			doDisp_ = doDisp;
 			doNormals_ = doNormals;
@@ -190,8 +193,8 @@ namespace OceanSimulation
 				fftin_(i, j) = htilda_(i, j)  * scaleNorm_;
 			};
 			maxon::ParallelFor::Dynamic(0, M_ * N_, prepareDisp);*/
-			
-			maxon::Int titleSize = maxon::Max(1, M_ / GeGetCurrentThreadCount());
+
+			maxon::Int titleSize = maxon::Max<maxon::Int>(1, M_ / 8);
 
 			auto prepareDisp = [&currentTime, &timeScale, this](maxon::Int i, maxon::Int j)
 			{
@@ -246,7 +249,7 @@ namespace OceanSimulation
 						(km_(i, j) == 0.0 ? maxon::Complex<maxon::Float>(0, 0) : kv_(i, j).x / km_(i, j));
 				};
 				maxon::ParallelImage::Process(M_, N_, titleSize, prepareChopX);
-				
+
 				KissFFT.Transform2D(fftin_, dispX_, fft_flags_) iferr_return;
 
 				//auto prepareChopZ = [this, &chopAmount](maxon::Int32 l)
@@ -295,7 +298,7 @@ namespace OceanSimulation
 						(km_(i, j) == 0.0 ? maxon::Complex<maxon::Float>(0, 0) : kv_(i, j).x * kv_(i, j).x / km_(i, j));
 				};
 				maxon::ParallelImage::Process(M_, N_, titleSize, prepareJXX);
-				
+
 				KissFFT.Transform2D(fftin_, jxx_, fft_flags_) iferr_return;
 
 				// jzz
@@ -347,7 +350,7 @@ namespace OceanSimulation
 				{
 					maxon::Int32 i = l / M_;
 					maxon::Int32 j = maxon::Mod(l, M_);
-					
+
 					maxon::Float a, b;
 					// maxon::Float qplus, qminus;
 					a = jxx_(i, j) + jzz_(i, j);
@@ -381,9 +384,12 @@ namespace OceanSimulation
 
 			return	self.EvaluateUV(type, maxon::Vector2d(p.x / Lx_, p.z / Lz_), displacement, normal, jMinus);
 		};
-		
+
 		MAXON_METHOD maxon::Result<void> EvaluateUV(const INTERTYPE type, maxon::Vector2d uv, maxon::Vector &displacement, maxon::Vector &normal, maxon::Float &jMinus) const
 		{
+            displacement = maxon::Vector(0.0);
+            normal = maxon::Vector(0.0);
+            jMinus = 0.0;
 			iferr_scope;
 
 			maxon::Int32 i0, i1, j0, j1;
@@ -479,34 +485,34 @@ namespace OceanSimulation
 			return maxon::OK;
 		};
 
-	private: 		
-		maxon::Int32									LT_;			///< phase of the simulation (looping time)
-		maxon::Float									Omega0_;		///< omega 0 (w0)  note (17) 2PI/T
-		maxon::Int32									M_;				///< the resolution of ocean in the X direction
-		maxon::Int32									N_;				///< the resolution of ocean in the Z direction
-		maxon::Float									Lx_;			///< the ocean size on unit in the x direction
-		maxon::Float									Lz_;			///< the ocean size on unit in the z direction 
-		maxon::Float									l_;				///< the shortest wave length
-		maxon::Float									A_;				///< Amplitude, desired wave height
-		maxon::Float									V_;				///< Wind Speed  in m/s
+	private:
+		maxon::Int32									LT_ = {};			///< phase of the simulation (looping time)
+		maxon::Float									Omega0_ = {};		///< omega 0 (w0)  note (17) 2PI/T
+		maxon::Int32									M_ = {};				///< the resolution of ocean in the X direction
+		maxon::Int32									N_ = {};				///< the resolution of ocean in the Z direction
+		maxon::Float									Lx_ = {};			///< the ocean size on unit in the x direction
+		maxon::Float									Lz_ = {};			///< the ocean size on unit in the z direction
+		maxon::Float									l_ = {};				///< the shortest wave length
+		maxon::Float									A_ = {};				///< Amplitude, desired wave height
+		maxon::Float									V_ = {};				///< Wind Speed  in m/s
 		maxon::Vector2d									WHat_;			///< wind direction
-		maxon::Float									CA_;			///< Chop amount for the chopiness
-		maxon::Float									oceanDepth_;	///< ocean's depth
-		maxon::Int32									seed_;			///< seed for the generator
+		maxon::Float									CA_ = {};			///< Chop amount for the chopiness
+		maxon::Float									oceanDepth_ = {};	///< ocean's depth
+		maxon::Int32									seed_ = {};			///< seed for the generator
 
 		maxon::MatrixNxM<maxon::Vector2d>				kv_;			///< store the vector k
 		maxon::MatrixNxM<maxon::Float>					km_;			///< store the magnitude of vector k
 
 
-		maxon::Float									alignement_;	///< alignement of the wave in the wind direciton 
-		maxon::Float									dampReflect_;	///< weight of damped waves
-		maxon::Float									scaleNorm_;		///< normalized scaled.
+		maxon::Float									alignement_ = {};	///< alignement of the wave in the wind direciton
+		maxon::Float									dampReflect_ = {};	///< weight of damped waves
+		maxon::Float									scaleNorm_ = {};		///< normalized scaled.
 
 
-		maxon::Bool										doDisp_;		///< have to calculate the displacement
-		maxon::Bool										doChop_;		///< have to calculate the chopiness
-		maxon::Bool										doNormals_;		///< have to calculate normals
-		maxon::Bool										doJacob_;		///< have to calculate jacobian
+		maxon::Bool										doDisp_ = {};		///< have to calculate the displacement
+		maxon::Bool										doChop_ = {};		///< have to calculate the chopiness
+		maxon::Bool										doNormals_ = {};		///< have to calculate normals
+		maxon::Bool										doJacob_ = {};		///< have to calculate jacobian
 
 		maxon::MatrixNxM<maxon::Complex<maxon::Float>>	h0_;			///< h0  (used in 26)
 		maxon::MatrixNxM<maxon::Complex<maxon::Float>>	h0_minus_;		///< h0 minus (used in 26)
@@ -527,27 +533,27 @@ namespace OceanSimulation
 
 		maxon::MatrixNxM<maxon::Float>					foam_; ///< the foam for actual frame
 		maxon::MatrixNxM<maxon::Float>					jMinus_; ///< store the jminus of the frame
-		maxon::Float									lastFrameCompute_; ///< time of the last frame computed.
+		maxon::Float									lastFrameCompute_ = {}; ///< time of the last frame computed.
 
 		const  maxon::FFT_FLAGS fft_flags_ = maxon::FFT_FLAGS::CALC_INVERSE; ///< the FFT flags --- can be maxon::FFT_FLAGS::CALC_INVERSE | maxon::FFT_FLAGS::SUPPRESS_PADDING
 
 		//----------------------------------------------------------------------------------------
 		/// calculate the Dispersion Relation  (18)
-		/// @param[in]  k  : the vector to calculate the omega 
+		/// @param[in]  k  : the vector to calculate the omega
 		/// return		the calculated Omega
 		//----------------------------------------------------------------------------------------
 		maxon::Float Omega(maxon::Float k)
 		{
-			// if depth >50 tanh(k * depth) become 1.0 so negligeable  
+			// if depth >50 tanh(k * depth) become 1.0 so negligeable
 			// if wave are small -> 1 + maxon::Sqr(k) * maxon::Sqr(L) (L =  uniths of length)
 			// calculate dispersion
 			maxon::Float omegaK = maxon::Sqrt(gravity * k  * maxon::Tanh(k * oceanDepth_));
 			// quantatize frequencies to repeat at timeloop
-			return  maxon::Floor(omegaK / Omega0_) * Omega0_;
+			return Omega0_ > 0.0 ? maxon::Floor(omegaK / Omega0_) * Omega0_ : omegaK;
 		};
 
 		//----------------------------------------------------------------------------------------
-		/// calculate the philip spectrum of the vector k 
+		/// calculate the philip spectrum of the vector k
 		/// @param[in]  k  : the vector to calculate the philip spectrum
 		/// return		the Phillips spectrum
 		//----------------------------------------------------------------------------------------
@@ -572,20 +578,20 @@ namespace OceanSimulation
 		//----------------------------------------------------------------------------------------
 		/// Evaluate the result of the simulation and return the vectors for displacemenet, normals and jacobian
 		/// @param[in]  uv  : 2d vector that give the u and v coordinate
-		/// @param[out]  displacement  : reference to store the displacement result 
+		/// @param[out]  displacement  : reference to store the displacement result
 		/// @param[out]  normal  : reference to store the normals result
 		/// @param[out]  jacob : reference to store the jacobian result
 		/// return maxon::OK on success
 		//----------------------------------------------------------------------------------------
-		
+
 
 		//----------------------------------------------------------------------------------------
 		/// Interpolation function, change interpolation by type
-		/// @param[in]  type  : type of interpolation to use 
-		/// @param[in]  m  : the matrix of data 
-		/// @param[in]  pointIndex  : an array that store the points to interpolate 
-		/// @param[in]  f1  : the first scalar 
-		/// @param[in]  f2  : the second scalar 
+		/// @param[in]  type  : type of interpolation to use
+		/// @param[in]  m  : the matrix of data
+		/// @param[in]  pointIndex  : an array that store the points to interpolate
+		/// @param[in]  f1  : the first scalar
+		/// @param[in]  f2  : the second scalar
 		/// return		the interpolated value
 		//----------------------------------------------------------------------------------------
 		maxon::Float Interpolation(const INTERTYPE type, const maxon::MatrixNxM<maxon::Float> &m, const maxon::BaseArray<maxon::Int32> &pointIndex, const maxon::Float f1, const maxon::Float  f2) const
@@ -657,7 +663,7 @@ namespace OceanSimulation
 				return res;
 			};
 
-			maxon::Complex<maxon::Float> complexOmega(1, 0);		// this is calculate at time 0 so 
+			maxon::Complex<maxon::Float> complexOmega(1, 0);		// this is calculate at time 0 so
 			maxon::Complex<maxon::Float> complexMinusOmega(1, 0); // omega*time or -omega * time -> Complex.setExp will end with  (1,0)  cos(0) and sin(0)
 
 			auto prepareFFTIN = [this, &complexOmega, &complexMinusOmega](maxon::Int32 l)
@@ -677,7 +683,7 @@ namespace OceanSimulation
 
 			KissFFT.Transform2D(fftin_, dispY_, fft_flags_) iferr_return;
 
-			maxon::Float maxHeight = maxon::MINRANGE_FLOAT;
+			maxon::Float maxHeight = 0.0;
 
 			// avoid using parallel loop to get max value.
 			for (maxon::Int32 i = 0; i < dispY_.GetXCount(); i++)
@@ -694,9 +700,9 @@ namespace OceanSimulation
 
 		//----------------------------------------------------------------------------------------
 		/// compute the jacobian variable
-		/// @param[in]  jxx  : the jacobian xx param 
-		/// @param[in]  jzz  : the jacobian zz param 
-		/// @param[in]  jxz  : the jacobian xz param 
+		/// @param[in]  jxx  : the jacobian xx param
+		/// @param[in]  jzz  : the jacobian zz param
+		/// @param[in]  jxz  : the jacobian xz param
 		/// @param[out] jMinus : the result of jacob
 		/// return maxon::OK on success
 		//----------------------------------------------------------------------------------------
@@ -713,7 +719,7 @@ namespace OceanSimulation
 		};
 
 		//----------------------------------------------------------------------------------------
-		/// @param[in]  windDirection  : the wind Direction that have to be translate to a Vector 
+		/// @param[in]  windDirection  : the wind Direction that have to be translate to a Vector
 		/// @return the wind Direction's vector normalized.
 		//----------------------------------------------------------------------------------------
 		maxon::Vector2d				GetWindDirectionNormalized(const maxon::Float windDirection) const

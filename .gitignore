@@ -8,3 +8,12 @@ project/hot4d.xcodeproj/project.pbxproj
 project/hot4d.vcxproj.filters
 hot4d.ilk
 hot4d.xlib
+build/
+dist/
+tests/fixtures/
+tests/results/
+__pycache__/
+
+# Local research notes; not part of the public project
+BASELINE-REVIEW.md
+SOURCE-COMPARISON.md

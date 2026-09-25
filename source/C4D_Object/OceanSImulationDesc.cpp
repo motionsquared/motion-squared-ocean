@@ -1,4 +1,4 @@
-//  
+//
 //  Created by Manuel MAGALHAES on 14/01/13.
 //  Copyright (c) 2013 Valkaari. All rights reserved.
 //
@@ -11,9 +11,7 @@
 #include "description/OceanDescription.h"
 #include "main.h"
 
-#define GLD_ID_OCEAN_DESCRIPTION 1057478
-
-Bool RegisterOceanSimulationDescription()
+cinema::Bool RegisterOceanSimulationDescription()
 {
-	return RegisterDescription(GLD_ID_OCEAN_DESCRIPTION, "OceanDescription"_s);
+	return cinema::RegisterDescription(MS_OCEAN_DESCRIPTION_ID, "OceanDescription"_s);
 }

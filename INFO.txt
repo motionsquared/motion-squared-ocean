@@ -1,1 +1,3 @@
-Source Code can be found here: https://github.com/kentbarber/HOT4D
+Motion Squared Ocean source: https://github.com/motionsquared/motion-squared-ocean
+Based on https://github.com/kentbarber/HOT4D and https://github.com/Valkaari/HOT4D.
+See THIRD-PARTY-NOTICES.md and LICENSE.txt for attribution and licensing.
